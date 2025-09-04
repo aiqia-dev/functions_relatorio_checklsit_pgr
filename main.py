@@ -420,10 +420,13 @@ class PgrChecklistPDFGenerator:
             raise
 
 
+from flask import Flask, request, jsonify, Response
+
+app = Flask(__name__)
 generator = PgrChecklistPDFGenerator()
 
-
-def main(request: Request):
+@app.route('/generate-report', methods=['POST'])
+def generate_report_endpoint():
     try:
         key = request.args.get('key')
         if not key:
@@ -444,3 +447,6 @@ def main(request: Request):
         return Response(str(ve), status=400)
     except Exception as e:
         return Response(f"Erro interno: {str(e)}", status=500)
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=8080)
