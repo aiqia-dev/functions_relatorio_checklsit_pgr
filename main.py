@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Dict, Optional, List, Tuple
 
 from google.cloud import storage
-from PIL import Image
+from PIL import Image, ImageDraw
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +38,88 @@ class PgrChecklistPDFGenerator:
         self.img_height = 35
         self.img_margin = 5
         self.line_height = 6
+
+    def _color_tuple(self, color: str) -> Tuple[int, int, int]:
+        m = (color or '').strip().lower()
+        mapping = {
+            'red': (255, 0, 0),
+            'green': (0, 200, 0),
+            'blue': (0, 0, 255),
+            'yellow': (255, 200, 0),
+            'orange': (255, 140, 0),
+            'purple': (160, 32, 240),
+            'white': (255, 255, 255),
+            'black': (0, 0, 0),
+        }
+        return mapping.get(m, (255, 0, 0))
+
+    def _apply_annotations(self, image_data: bytes, annotations: List[Dict]) -> bytes:
+        """Aplica retângulos/pontos/círculos na imagem conforme 'annotations'."""
+        try:
+            with Image.open(io.BytesIO(image_data)) as img:
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                draw = ImageDraw.Draw(img)
+                for ann in annotations or []:
+                    try:
+                        ann_type = (ann.get('annotationType') or ann.get('type') or 'box').strip().lower()
+                        coords_raw = ann.get('coordinates')
+                        color = self._color_tuple(ann.get('color') or 'red')
+                        width = 3
+                        coords = {}
+                        if isinstance(coords_raw, dict):
+                            coords = coords_raw
+                        elif isinstance(coords_raw, str):
+                            import json
+                            coords = json.loads(coords_raw)
+                        x = float(coords.get('x', 0))
+                        y = float(coords.get('y', 0))
+                        w = float(coords.get('w', 0))
+                        h = float(coords.get('h', 0))
+
+                        if ann_type in ('box', 'rectangle', 'rect'):
+                            draw.rectangle([(x, y), (x + w, y + h)], outline=color, width=width)
+                        elif ann_type in ('circle', 'ellipse'):
+                            draw.ellipse([(x, y), (x + w, y + h)], outline=color, width=width)
+                        elif ann_type in ('point', 'dot'):
+                            r = max(3.0, min(8.0, w or 5.0))
+                            draw.ellipse([(x - r, y - r), (x + r, y + r)], fill=color, outline=color, width=1)
+                        else:
+                            draw.rectangle([(x, y), (x + w, y + h)], outline=color, width=width)
+                    except Exception as e:
+                        print(f"Alerta: falha ao desenhar anotação: {str(e)}")
+                out = io.BytesIO()
+                img.save(out, format='JPEG', quality=85, optimize=True)
+                return out.getvalue()
+        except Exception as e:
+            print(f"Alerta: não foi possível aplicar anotações: {str(e)}")
+            return image_data
+
+    def _fetch_single_image_bytes(self, img_obj: Dict) -> Optional[bytes]:
+        """Obtém os bytes de uma imagem considerando img_path, URLs GCS ou HTTP."""
+        try:
+            p = img_obj.get('img_path')
+            u = img_obj.get('img_url') or img_obj.get('url')
+            if p:
+                blob = self.bucket.blob(p)
+                if blob.exists():
+                    return blob.download_as_bytes()
+                print(f"Alerta: Imagem não encontrada no GCS (bucket padrão): {p}")
+            if u:
+                gcs_info = self._parse_gcs_url(u)
+                if gcs_info:
+                    bucket_name, object_path = gcs_info
+                    bkt = self.gcs_client.bucket(bucket_name)
+                    blob = bkt.blob(object_path)
+                    if blob.exists():
+                        return blob.download_as_bytes()
+                    print(f"Alerta: Imagem GCS não encontrada: gs://{bucket_name}/{object_path}")
+                else:
+                    return self._download_single_url(u)
+            return None
+        except Exception as e:
+            print(f"Erro ao obter imagem: {str(e)}")
+            return None
 
     def quick_reencode_jpg(self, image_data: bytes, quality: int = 25) -> Optional[bytes]:
         try:
@@ -214,14 +296,22 @@ class PgrChecklistPDFGenerator:
         return total_lines
 
     def _format_date(self, date_str: Optional[str]) -> str:
-        if not date_str:
+        if date_str is None:
             return 'N/A'
-        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%fZ'):
+        s = str(date_str).strip()
+        if not s or s.lower() in ('n/a', 'na', 'none', 'null', '-'):
+            return 'N/A'
+        for fmt in (
+            '%Y-%m-%d %H:%M:%S',
+            '%Y-%m-%d %H:%M:%S.%f',
+            '%Y-%m-%dT%H:%M:%S',
+            '%Y-%m-%dT%H:%M:%S.%fZ',
+        ):
             try:
-                return datetime.strptime(date_str, fmt).strftime('%d-%m-%Y %H:%M:%S')
+                return datetime.strptime(s, fmt).strftime('%d-%m-%Y %H:%M:%S')
             except Exception:
                 continue
-        return 'Data inválida'
+        return s
 
     def generate_pdf(self, request_data: Dict, key: str) -> bytes:
         try:
@@ -277,30 +367,40 @@ class PgrChecklistPDFGenerator:
             pdf.add_page()
             pdf.set_font("helvetica", size=10)
 
-            try:
-                blob = self.bucket.blob(self.logo_blob)
-                if blob.exists():
-                    logo_bytes = blob.download_as_bytes()
-                    with io.BytesIO(logo_bytes) as logo_buffer:
-                        pdf.image(logo_buffer, x=10, y=12, w=25)
-                else:
-                    pdf.text(10, 15, 'Logo N/A')
-            except Exception as e:
-                pdf.text(10, 15, 'Logo N/A')
-                print(f"Erro ao carregar logo do bucket: {str(e)}")
+            # Header com título centralizado (sem logo)
+            header_y = 10
+            pdf.set_font("helvetica", style="B", size=14)
+            title = "Checklist PGR"
+            pdf.set_xy(0, header_y + 2)
+            pdf.cell(w=pdf.w, h=8, txt=title, border=0, align='C')
+            pdf.set_font("helvetica", size=10)
 
-            pdf.set_y(10)
-            pdf.set_x(40)
+            # Linha separadora sutil
+            pdf.set_draw_color(200, 200, 200)
+            pdf.set_line_width(0.2)
+            pdf.line(pdf.l_margin, header_y + 12, pdf.w - pdf.r_margin, header_y + 12)
 
-            pdf.cell(50, self.line_height, f"Código: {key}", new_x=XPos.RIGHT, new_y=YPos.TOP)
-            pdf.cell(50, self.line_height, f"KM: {km}", new_x=XPos.RIGHT, new_y=YPos.TOP)
+            # Bloco de metadados
+            pdf.set_y(header_y + 16)
+            pdf.set_x(pdf.l_margin)
+
+            # Layout: Código ocupa 2 colunas (antes: Código+KM) e as datas ficam empilhadas na coluna da direita
+            page_width = pdf.w - pdf.l_margin - pdf.r_margin
+            left_block_w = 120  # 60 (Código) + 60 (KM que foi removido)
+            if left_block_w > page_width * 0.7:
+                left_block_w = int(page_width * 0.6)
+
+            # Primeira linha: Código (esquerda larga) + Data Execução (direita)
+            pdf.cell(left_block_w, self.line_height, f"Código: {key}", new_x=XPos.RIGHT, new_y=YPos.TOP)
             pdf.cell(0, self.line_height, f"Data Execução: {run_date}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-            pdf.set_x(40)
-            pdf.cell(50, self.line_height, f"Placa: {placa}", new_x=XPos.RIGHT, new_y=YPos.TOP)
-            pdf.cell(50, self.line_height, f"Tipo: {tipo_evento}", new_x=XPos.RIGHT, new_y=YPos.TOP)
+            # Segunda linha: Placa + Tipo à esquerda e Data Validação à direita na MESMA linha
+            pdf.set_x(pdf.l_margin)
+            pdf.cell(60, self.line_height, f"Placa: {placa}", new_x=XPos.RIGHT, new_y=YPos.TOP)
+            pdf.cell(60, self.line_height, f"Tipo: {tipo_evento}", new_x=XPos.RIGHT, new_y=YPos.TOP)
+            pdf.set_x(pdf.l_margin + left_block_w)
             pdf.cell(0, self.line_height, f"Data Validação: {data_validacao}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            pdf.ln(5)
+            pdf.ln(3)
 
             page_width = pdf.w - pdf.l_margin - pdf.r_margin
             gap = 2
@@ -331,18 +431,18 @@ class PgrChecklistPDFGenerator:
                     conforme = item.get('conforme')
                     problema = (item.get('problema_identificado', '') or 'Nenhum').strip().replace("\n", " ")
                     imagens = item.get('imagens', []) or []
+                    # 'budget' não é monetário; significa contorno/box do status — já será aplicado no badge
 
                     rotulo = item.get('item') or item.get('label') or ''
 
-                    item_full_text = (
-                        f"Item: {rotulo}\n"
-                        f"Status: {'Conforme' if conforme == 1 else 'Não Conforme'}\n"
-                        f"Problema(s): {problema}"
-                    )
+                    # Título do item
+                    item_title_line = f"Item: {rotulo}"
+                    problema_line = f"Problema(s): {problema}"
 
                     available_width = pdf.w - pdf.l_margin - pdf.r_margin
-                    num_lines = self._get_text_line_count(pdf, item_full_text, available_width)
-                    text_height = num_lines * 5
+                    lines_item = self._get_text_line_count(pdf, item_title_line, available_width)
+                    lines_prob = self._get_text_line_count(pdf, problema_line, available_width)
+                    text_height = (lines_item + lines_prob + 1) * 5  # +1 para a linha do status/badges
 
                     image_rows = (len(imagens) + 2) // 3
                     images_height = image_rows * (self.img_height + self.img_margin)
@@ -352,56 +452,168 @@ class PgrChecklistPDFGenerator:
                     if pdf.get_y() + block_height > pdf.page_break_trigger:
                         pdf.add_page()
 
-                    fill_color = (230, 240, 255) if conforme == 1 else (255, 200, 200)
-                    pdf.set_fill_color(*fill_color)
+                    # Linha: Item
+                    pdf.multi_cell(w=0, h=5, txt=item_title_line, border=0, align='L')
 
-                    pdf.multi_cell(w=0, h=5, txt=item_full_text, border=0, align='L', fill=True)
+                    # Linha: Status (badge discreta com contorno)
+                    pdf.set_x(pdf.l_margin)
+                    status_text = 'Conforme' if conforme == 1 else 'Não Conforme'
+                    if conforme == 1:
+                        stroke_rgb = (76, 175, 80)   # verde médio para contorno
+                        text_rgb = (46, 125, 50)     # verde escuro no texto
+                        bg_rgb = (245, 252, 246)     # leve fundo quase branco
+                    else:
+                        stroke_rgb = (229, 57, 53)   # vermelho médio para contorno
+                        text_rgb = (183, 28, 28)
+                        bg_rgb = (254, 246, 246)
+
+                    pdf.set_text_color(0, 0, 0)
+                    pdf.set_font("helvetica", size=10)
+                    pdf.cell(pdf.get_string_width("Status: ") + 1, 5, "Status: ", border=0, align='L')
+
+                    pad_x = 3
+                    badge_h = 5
+                    badge_w = pdf.get_string_width(status_text) + 2 * pad_x
+                    x0 = pdf.get_x()
+                    y0 = pdf.get_y()
+                    # Leve fundo (opcional) e contorno
+                    try:
+                        pdf.set_fill_color(*bg_rgb)
+                        pdf.set_draw_color(*stroke_rgb)
+                        pdf.set_line_width(0.4)
+                        pdf.rounded_rect(x0, y0, badge_w, badge_h, 1.5, style='FD')
+                    except Exception:
+                        # Fallback: célula com borda
+                        pdf.set_draw_color(*stroke_rgb)
+                        pdf.set_line_width(0.4)
+                        pdf.rect(x0, y0, badge_w, badge_h)
+
+                    # Texto centralizado dentro do badge
+                    pdf.set_text_color(*text_rgb)
+                    pdf.set_font("helvetica", style="B", size=9)
+                    pdf.set_xy(x0, y0)
+                    pdf.cell(badge_w, badge_h, status_text, border=0, align='C', fill=False)
+
+                    # Tags do item como badges discretas cinza (ao lado do status), com quebra de linha automática
+                    tags = item.get('tags') or []
+                    if isinstance(tags, list) and tags:
+                        pdf.set_font("helvetica", size=8)
+                        pdf.set_text_color(80, 80, 80)
+                        pdf.set_draw_color(180, 180, 180)
+                        pdf.set_line_width(0.3)
+                        pdf.set_x(x0 + badge_w + 3)
+                        right_edge = pdf.w - pdf.r_margin
+                        for t in tags:
+                            try:
+                                label = ''
+                                if isinstance(t, dict):
+                                    k = (t.get('key') or '').strip()
+                                    v = (t.get('value') or '').strip()
+                                    label = (f"{k}: {v}" if k and v else (v or k))
+                                else:
+                                    label = str(t).strip()
+                                if not label:
+                                    continue
+                                tw = pdf.get_string_width(label)
+                                pad = 2
+                                bw = tw + pad * 2
+                                x = pdf.get_x()
+                                y = pdf.get_y()
+                                if x + bw > right_edge:
+                                    pdf.ln(badge_h)
+                                    pdf.set_x(pdf.l_margin)
+                                    x = pdf.get_x()
+                                    y = pdf.get_y()
+                                try:
+                                    pdf.rounded_rect(x, y, bw, badge_h, 1.2, style='D')
+                                except Exception:
+                                    pdf.rect(x, y, bw, badge_h)
+                                pdf.set_xy(x + pad, y)
+                                pdf.cell(tw, badge_h, label, border=0, align='L')
+                                pdf.set_x(x + bw + 2)
+                            except Exception:
+                                continue
+
+                    # Quebra de linha após status/tags
+                    pdf.ln(badge_h)
+
+                    # Linha: Problema(s)
+                    pdf.set_text_color(0, 0, 0)
+                    pdf.set_font("helvetica", size=10)
+                    pdf.multi_cell(w=0, h=5, txt=problema_line, border=0, align='L')
 
                     if imagens:
                         pdf.ln(2)
                         x_start = pdf.get_x()
                         col_count = 0
+                        row_max_height = 0
 
-                        # Coletar GCS (bucket,obj), paths no bucket padrão e URLs HTTP
-                        gcs_targets: List[Tuple[str, str]] = []
-                        raw_paths = []  # caminhos relativos ao bucket padrão
-                        url_candidates = []  # URLs não-GCS para HTTP
+                        processed_images_with_captions: List[Tuple[bytes, str]] = []
                         for img in imagens:
-                            p = img.get('img_path')
-                            u = img.get('img_url') or img.get('url')
-                            if p:
-                                raw_paths.append(p)
-                            if u:
-                                gcs_info = self._parse_gcs_url(u)
-                                if gcs_info:
-                                    gcs_targets.append(gcs_info)
-                                else:
-                                    url_candidates.append(u)
+                            data = self._fetch_single_image_bytes(img)
+                            if not data:
+                                continue
+                            annotations = img.get('annotations') or []
+                            try:
+                                annotated = self._apply_annotations(data, annotations) if annotations else data
+                            except Exception as e:
+                                print(f"Alerta: falha ao aplicar anotações, usando imagem original: {str(e)}")
+                                annotated = data
 
-                        image_data_list: List[bytes] = []
-                        if raw_paths:
-                            image_data_list.extend([d for d in self.download_images_batch(raw_paths) if d])
-                        if gcs_targets:
-                            image_data_list.extend([d for d in self.download_gcs_targets_batch(gcs_targets) if d])
-                        if url_candidates:
-                            image_data_list.extend([d for d in self.download_urls_batch(url_candidates) if d])
+                            rec = self.quick_reencode_jpg(annotated)
+                            if rec is None:
+                                try:
+                                    Image.open(io.BytesIO(annotated)).close()
+                                    final_bytes = annotated
+                                except Exception:
+                                    print("Alerta: bytes de imagem inválidos após fallback; imagem será ignorada")
+                                    continue
+                            else:
+                                final_bytes = rec
 
-                        processed_images = list(executor.map(self.quick_reencode_jpg, image_data_list)) if image_data_list else []
+                            descriptions: List[str] = []
+                            for ann in annotations:
+                                desc = (ann.get('description') or '').strip()
+                                if desc:
+                                    descriptions.append(f"- {desc}")
+                            caption = "\n".join(descriptions)
+                            processed_images_with_captions.append((final_bytes, caption))
 
-                        for img_data in processed_images:
+                        for img_data, caption in processed_images_with_captions:
                             if not img_data:
                                 continue
                             if col_count == 3:
-                                pdf.ln(self.img_height + self.img_margin)
+                                pdf.ln(row_max_height + self.img_margin if row_max_height else (self.img_height + self.img_margin))
                                 pdf.set_x(x_start)
                                 col_count = 0
-                            with io.BytesIO(img_data) as img_buffer:
-                                pdf.image(img_buffer, x=pdf.get_x(), y=pdf.get_y(), w=self.img_width, h=self.img_height)
-                            pdf.set_x(pdf.get_x() + self.img_width + self.img_margin)
+                                row_max_height = 0
+
+                            x = pdf.get_x()
+                            y = pdf.get_y()
+                            try:
+                                with io.BytesIO(img_data) as img_buffer:
+                                    pdf.image(img_buffer, x=x, y=y, w=self.img_width, h=self.img_height)
+                            except Exception as e:
+                                print(f"Alerta: falha ao inserir imagem no PDF; ignorando. Erro: {str(e)}")
+                                continue
+
+                            used_height = self.img_height
+                            cap = (caption or '').strip()
+                            if cap:
+                                pdf.set_xy(x, y + self.img_height + 1)
+                                lines = self._get_text_line_count(pdf, cap.replace('\r', ''), self.img_width)
+                                line_h = 4
+                                pdf.set_font("helvetica", size=8)
+                                pdf.multi_cell(self.img_width, line_h, cap, border=0)
+                                pdf.set_font("helvetica", size=10)
+                                used_height += 1 + lines * line_h
+
+                            row_max_height = max(row_max_height, used_height)
+                            pdf.set_xy(x + self.img_width + self.img_margin, y)
                             col_count += 1
 
                         if col_count > 0:
-                            pdf.ln(self.img_height + 4)
+                            pdf.ln(row_max_height + 4 if row_max_height else (self.img_height + 4))
                         else:
                             pdf.ln(5)
                     else:
